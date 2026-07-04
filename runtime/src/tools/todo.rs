@@ -1,10 +1,11 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use async_trait::async_trait;
 use super::{ParamDef, Tool};
 use serde_json::Value;
 
 thread_local! {
-    static TODOS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    static TODOS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
 }
 
 pub struct Todo;
@@ -19,35 +20,43 @@ impl Tool for Todo {
             ParamDef { name: "item", param_type: "string", description: "待办内容（add/done 时需要），例如：'买牛奶'", required: false },
         ]
     }
-    async fn execute(&self, args: &Value) -> Result<String, String> {
+    async fn execute(&self, session_id: &str, args: &Value) -> Result<String, String> {
         let cmd = args.get("cmd").and_then(|v| v.as_str()).ok_or_else(|| "缺少 cmd 参数".to_string())?;
         match cmd {
             "add" => {
                 let item = args.get("item").and_then(|v| v.as_str()).ok_or_else(|| "add 需要 item 参数".to_string())?;
-                TODOS.with(|t| t.borrow_mut().push(item.to_string()));
+                TODOS.with(|t| t.borrow_mut().entry(session_id.to_string()).or_default().push(item.to_string()));
                 Ok(format!("已添加待办: {}", item))
             }
             "list" => {
                 Ok(TODOS.with(|t| {
                     let list = t.borrow();
-                    if list.is_empty() {
-                        "暂无待办事项".to_string()
-                    } else {
-                        let mut s = String::from("待办列表：\n");
-                        for (i, item) in list.iter().enumerate() {
-                            s.push_str(&format!("{}. {}\n", i + 1, item));
+                    let items = list.get(session_id);
+                    match items {
+                        Some(items) if !items.is_empty() => {
+                            let mut s = String::from("待办列表：\n");
+                            for (i, item) in items.iter().enumerate() {
+                                s.push_str(&format!("{}. {}\n", i + 1, item));
+                            }
+                            s
                         }
-                        s
+                        _ => "暂无待办事项".to_string(),
                     }
                 }))
             }
             "done" => {
                 let item = args.get("item").and_then(|v| v.as_str()).ok_or_else(|| "done 需要 item 参数".to_string())?;
                 Ok(TODOS.with(|t| {
-                    let mut list = t.borrow_mut();
-                    let pos = list.iter().position(|x| x == item);
-                    match pos {
-                        Some(i) => { list.remove(i); format!("已完成: {}", item) }
+                    let mut map = t.borrow_mut();
+                    let items = map.get_mut(session_id);
+                    match items {
+                        Some(items) => {
+                            let pos = items.iter().position(|x| x == item);
+                            match pos {
+                                Some(i) => { items.remove(i); format!("已完成: {}", item) }
+                                None => format!("未找到待办: {}", item)
+                            }
+                        }
                         None => format!("未找到待办: {}", item)
                     }
                 }))

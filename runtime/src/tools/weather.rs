@@ -19,7 +19,7 @@ impl Tool for Weather {
         }]
     }
 
-    async fn execute(&self, args: &Value) -> Result<String, String> {
+    async fn execute(&self, _session_id: &str, args: &Value) -> Result<String, String> {
         let city = args.get("city").and_then(|v| v.as_str()).ok_or_else(|| "缺少 city 参数".to_string())?;
         let encoded = js_sys::encode_uri_component(city);
         let url = format!("https://uapis.cn/api/v1/misc/weather?city={}&lang=zh", encoded.as_string().unwrap_or_else(|| city.to_string()));
@@ -37,13 +37,12 @@ impl Tool for Weather {
             .map_err(|e| format!("读取响应失败: {:?}", e))?
             .as_string().ok_or_else(|| "响应为空".to_string())?;
 
-        // 解析 JSON 提取关键信息
         if let Ok(json) = serde_json::from_str::<Value>(&text) {
             let parts = vec![
                 json.get("data").and_then(|d| d.get("weather").and_then(|w| w.as_str())).map(|v| format!("天气：{}", v)),
-                json.get("data").and_then(|d| d.get("temp").map(|t| format!("温度：{}°C", t))),
+                json.get("data").and_then(|d| d.get("temperature").map(|t| format!("温度：{}°C", t))),
                 json.get("data").and_then(|d| d.get("humidity").map(|h| format!("湿度：{}%", h))),
-                json.get("data").and_then(|d| d.get("wind").map(|w| format!("风：{}", w))),
+                json.get("data").and_then(|d| d.get("wind_power").map(|w| format!("风力：{}", w))),
             ];
             let info: Vec<&str> = parts.iter().filter_map(|p| p.as_deref()).collect();
             if info.is_empty() {

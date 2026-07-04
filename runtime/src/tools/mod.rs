@@ -21,7 +21,10 @@ pub trait Tool {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn parameters(&self) -> Vec<ParamDef>;
-    async fn execute(&self, args: &Value) -> Result<String, String>;
+    /// 执行工具
+    ///   session_id: 当前会话 ID，用于隔离各 session 的数据
+    ///   args: 工具参数
+    async fn execute(&self, session_id: &str, args: &Value) -> Result<String, String>;
 }
 
 /// 工具注册表
@@ -70,10 +73,10 @@ impl ToolRegistry {
         lines.join("\n")
     }
 
-    pub async fn execute(&self, name: &str, args: &Value) -> Result<String, String> {
+    pub async fn execute(&self, session_id: &str, name: &str, args: &Value) -> Result<String, String> {
         match self.tools.iter().find(|t| t.name() == name) {
-            Some(tool) => tool.execute(args).await,
-            None => Err(format!("没有这个工具：{}，可用工具：{}", name, self.tools.iter().map(|t| t.name()).collect::<Vec<_>>().join(", "))),
+            Some(tool) => tool.execute(session_id, args).await,
+            None => Err(format!("没有这个工具：{}", name)),
         }
     }
 }

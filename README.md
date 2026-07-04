@@ -75,19 +75,19 @@ Browser
 │   └── ApiKeyInput    — API 配置
 │
 └── WASM Module（@vibe-agent/runtime）
-    ├── Agent Runtime     ← Rust 核心循环
-    ├── Tool Registry     ← 工具注册 + 调度
-    │   ├── Calculator    ← 真实计算（js_sys）
+    ├── Agent Runtime     ← ReAct 循环（tool_call / final_answer / ask_user）
+    ├── Tool Registry     ← Trait 抽象工具注册
+    │   ├── Calculator    ← 真实计算（js_sys Function）
     │   ├── Weather       ← 真实 API（uapis.cn）
-    │   ├── Todo          ← 内存存储
+    │   ├── Todo          ← 内存存储（thread_local Vec）
     │   └── Search        ← Mock
-    ├── Session Manager   ← 多会话隔离
-    ├── Context Manager   ← 消息累积 + 压缩
-    ├── Output Parser     ← JSON action 解析
-    └── Trace Logger      ← 执行链路日志
+    ├── Session Manager   ← 多会话隔离 + turn_count 上限
+    ├── Memory            ← 消息累积 + Context 压缩
+    ├── Output Parser     ← JSON 解析 + think 标签过滤 + fallback
+    └── Trace Logger      ← 执行日志（按 session 累积，不截断）
 ```
 
-### Agent Loop 流程
+### Agent Loop 流程（ReAct）
 
 ```
 用户输入
@@ -96,23 +96,29 @@ Browser
 prepare_send_message() → 追加 user msg，turn_count++
     │
     ▼
-run_agent_loop() (最多 10 轮)
+run_agent_loop() (最大轮次 10)
     │
-    ├── 1. build_request() → 构造 OpenAI 兼容请求体
-    ├── 2. call_llm() → 通过 Vercel proxy (/api/llm) 调 LLM API
-    ├── 3. extract_think() → 提取 <think> 内容到 trace
-    ├── 4. parse_actions() → 提取所有 {} JSON action
+    ├── 1. build_request()     → 构造 OpenAI 兼容请求体
+    ├── 2. call_llm()          → Vercel proxy (/api/llm) → LLM API
+    ├── 3. extract_think()     → 提取 <think> 到 trace（完整内容）
+    ├── 4. parse_actions()     → 提取所有 {} JSON action
     │       │
-    │       ├── 空 → 幻觉重试
-    │       ├── answer → 返回结果给用户 ✅
-    │       └── use_tool → ↓
+    │       ├── 空 → 幻觉，重试
+    │       ├── final_answer → 返回最终结果 ✅
+    │       ├── ask_user     → 反问用户
+    │       └── tool_call    → ↓
     │
-    ├── 5. 执行所有工具 (async)
+    ├── 5. 检查是否有 final_answer + tool_call 混合
+    │       └── 有 → 执行工具，将工具结果发给 LLM，
+    │                LLM 看到真实结果后重新生成最终 final_answer
+    │
+    ├── 6. 执行所有工具（async）
     │       ├── has() 检查工具是否存在
     │       ├── execute() 异步执行
+    │       ├── thought 字段 → trace 日志
     │       └── 收集全部结果
     │
-    └── 6. 工具结果回 LLM → 回到 1
+    └── 7. 工具结果回 LLM → 回到 1
 ```
 
 ### Session 管理
@@ -133,7 +139,15 @@ max_turns: 50            max_turns: 50
 - 删除：`deleteSession()` → WASM 移除 + UI 更新
 - 持久化：session 列表存 localStorage（仅用于展示，WASM 状态在内存中）
 
-### Context 管理
+### Memory 记忆系统
+
+**`memory.rs` — Memory 结构体**
+
+```rust
+pub struct Memory {
+    pub short_term: Vec<Message>,  // 当前对话消息
+}
+```
 
 **塞入 context 的内容：**
 
@@ -141,8 +155,8 @@ max_turns: 50            max_turns: 50
 [messages 列表]
 ├── system prompt（工具说明 + 格式规则）
 ├── user 输入
-├── assistant 回复（JSON answer 或 use_tool）
-│   └── 工具执行结果（汇总后作为 user 消息回 LLM）
+├── assistant 回复（JSON: tool_call / final_answer / ask_user）
+│   └── 工具执行结果（[工具结果] xxx，回 LLM 继续）
 ├── user 输入（追问）
 ├── assistant 回复
 │   └── ...
@@ -151,15 +165,21 @@ max_turns: 50            max_turns: 50
 
 **最大轮次限制：** `max_turns: 50`，超限返回"会话已过期"。
 
-**上下文压缩（`session.rs:compress()`）：**
-- 超 41 条消息时触发
+**上下文压缩（`memory.rs:compress()`）：**
+- 超 41 条时触发
 - 保留 system 消息
 - 保留最近 40 条（约 20 轮对话）
 - 中间插入 `[上下文已压缩]` 标记
 
-### Tool 系统
+**Trace 日志：** 按 session 独立累积（`sessionTraces: Record<string, TraceEntry[]>`）
+- 新消息的 trace 追加到历史末尾，不覆盖
+- 切换 session 时自动加载对应历史 trace
+- 所有内容完整输出，无截断（已移除所有 `take(N)`）
+
+### Tool 系统（Trait 抽象）
 
 ```rust
+#[async_trait(?Send)]
 pub trait Tool {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
@@ -186,25 +206,40 @@ LLM 原始响应
     │
     ├── extract_text() → 从 OpenAI 格式中提取 content
     │       │
-    │       ├── strip_think_tags() → 去掉 <think> 标签
+    │       ├── strip_think_tags() → 去掉 <think>/<reasoning> 标签
+    │       │     ├── 有关闭标签 → 删整个块
+    │       │     └── 无关闭标签 → 只删开始标签
     │       └── strip_markdown() → 去掉 ```json 标记
     │
     ├── extract_json_objects() → 花括号匹配，提取所有 {}
+    │       └── fallback_extract_json() → 匹配失败时找第一个 {} 块
     │
-    └── parse_single_action() → 解析每个 JSON
+    └── parse_single() → 解析每个 JSON
             │
-            ├── use_tool → 拆成 tool name + params
-            ├── answer → 提取 content
-            └── 旧格式 → 兼容直接 action 名
+            ├── type: "tool_call"  → 拆成 tool name + params + thought
+            ├── type: "final_answer" → 提取 content
+            ├── type: "ask_user"   → 提取 question
+            ├── action: "use_tool" → 兼容旧格式
+            └── action: "answer"   → 兼容旧格式
 ```
+
+**思考过程（think 标签）：**
+- `extract_think()` 提取 think/reasoning 内容到 trace 日志
+- 前端 `MessageBubble` 组件支持展开/收起显示
+- `strip_think_tags()` 从 JSON 解析前剥离，不影响 action 提取
 
 ### LLM 调用链路（CORS 处理）
 
 ```
-Browser WASM → /api/llm (同源) → Vercel Serverless Function → LLM API (Gitee/OpenAI)
+Browser WASM → /api/llm (同源) → Vercel Serverless Function → LLM API (Gitee/OpenAI/自建)
 ```
 
 `/api/llm` 是 Vercel Serverless Function（`api/llm.mjs`），做请求转发，解决浏览器 CORS 限制。
+
+**URL 自动补全（`llm.rs:normalize_url()`）：**
+- `ai.gitee.com` → `https://ai.gitee.com/v1/chat/completions`
+- `ai.gitee.com/v1` → `https://ai.gitee.com/v1/chat/completions`
+- `https://api.openai.com/v1/chat/completions` → 不变
 
 ---
 

@@ -16,13 +16,12 @@ impl Tool for Calculator {
             required: true,
         }]
     }
-    async fn execute(&self, args: &Value) -> Result<String, String> {
+    async fn execute(&self, _session_id: &str, args: &Value) -> Result<String, String> {
         let expr = args.get("expression").and_then(|v| v.as_str()).ok_or_else(|| "缺少 expression 参数".to_string())?;
         let sanitized: String = expr.chars().filter(|c| c.is_ascii_digit() || "+-*/.() ".contains(*c)).collect();
         let sanitized = sanitized.trim();
         if sanitized.is_empty() { return Err("无效表达式".to_string()); }
 
-        // 用 JavaScript 的 Function 安全求值（只允许数学运算）
         let result = js_sys::Function::new_with_args("expr", &format!("return ({})", sanitized))
             .call1(&wasm_bindgen::JsValue::NULL, &wasm_bindgen::JsValue::from_str(sanitized))
             .map_err(|e| format!("计算错误: {:?}", e))?;

@@ -205,7 +205,7 @@ async fn run_agent_loop(mut prep: runtime::AgentLoopContext) -> runtime::AgentRe
                 continue;
             }
 
-            let result = prep.tool_registry.execute(&action.action, &serde_json::Value::Object(action.args.clone())).await;
+            let result = prep.tool_registry.execute(&prep.session_id, &action.action, &serde_json::Value::Object(action.args.clone())).await;
             let result_str = match &result {
                 Ok(r) => { prep.traces.info("工具结果".into(), r.clone()); r.clone() }
                 Err(e) => { prep.traces.error("工具错误".into(), e.clone()); e.clone() }

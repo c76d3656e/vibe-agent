@@ -16,7 +16,7 @@ impl Tool for Search {
             required: true,
         }]
     }
-    async fn execute(&self, args: &Value) -> Result<String, String> {
+    async fn execute(&self, _session_id: &str, args: &Value) -> Result<String, String> {
         let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| "缺少 query 参数".to_string())?;
         Ok(format!(
             "[Mock 搜索结果] 关于 \"{}\" 的模拟结果:\n1. {} 的相关信息\n2. {} 的最新动态\n（此为 Mock 数据）",
