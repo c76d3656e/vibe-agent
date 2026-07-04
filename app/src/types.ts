@@ -1,6 +1,6 @@
 /* ========== 消息类型 ========== */
 
-export type MessageRole = 'user' | 'assistant' | 'tool'
+export type MessageRole = 'system' | 'user' | 'assistant' | 'tool'
 
 export interface Message {
   role: MessageRole

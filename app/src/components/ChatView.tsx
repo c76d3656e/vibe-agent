@@ -136,7 +136,7 @@ export const ChatView: React.FC<Props> = ({ session, isProcessing, onSend }) => 
             <div style={styles.emptyText}>新建或选择一个会话开始</div>
           </div>
         )}
-        {session?.messages.map((m, i) => (
+        {session?.messages.filter(m => m.role !== 'system').map((m, i) => (
           <React.Fragment key={i}>
             {m.tool_name ? (
               <ToolCallCard

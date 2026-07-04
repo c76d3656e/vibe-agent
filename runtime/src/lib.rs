@@ -6,6 +6,7 @@ pub mod trace;
 pub mod error;
 pub mod tools;
 pub mod llm;
+pub mod memory;
 
 use wasm_bindgen::prelude::*;
 use std::cell::RefCell;
@@ -39,7 +40,7 @@ pub fn create_session(name: String) -> String {
             Some(runtime) => {
                 let id = runtime.create_session(name);
                 match runtime.get_session(&id) {
-                    Some(session) => serde_json::to_string(session).unwrap_or_default(),
+                    Some(session) => session.to_json(),
                     None => String::new(),
                 }
             }
@@ -66,7 +67,8 @@ pub fn get_sessions() -> String {
         match guard.as_ref() {
             Some(runtime) => {
                 let sessions = runtime.list_sessions();
-                serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
+                let json_list: Vec<String> = sessions.iter().map(|s| s.to_json()).collect();
+                format!("[{}]", json_list.join(","))
             }
             None => "[]".to_string(),
         }
@@ -79,7 +81,7 @@ pub fn get_session_messages(session_id: String) -> String {
         let guard = rt.borrow();
         match guard.as_ref() {
             Some(runtime) => match runtime.get_session(&session_id) {
-                Some(session) => serde_json::to_string(&session.messages).unwrap_or_else(|_| "[]".to_string()),
+                Some(session) => serde_json::to_string(&session.memory.short_term).unwrap_or_else(|_| "[]".to_string()),
                 None => "[]".to_string(),
             },
             None => "[]".to_string(),
@@ -141,8 +143,7 @@ async fn run_agent_loop(mut prep: runtime::AgentLoopContext) -> runtime::AgentRe
 
         // 提取思考过程并记录日志
         if let Some(think) = parser::extract_think(&response_text) {
-            let think_preview: String = think.chars().take(150).collect();
-            prep.traces.info("🤔 思考过程".into(), think_preview);
+            prep.traces.info("🤔 思考过程".into(), think);
         }
 
         // 解析所有 JSON action
@@ -162,25 +163,41 @@ async fn run_agent_loop(mut prep: runtime::AgentLoopContext) -> runtime::AgentRe
 
         // 记录所有解析出的 action
         for a in &actions {
-            prep.traces.info("action".into(), format!("{} args: {:?}", a.action, a.args));
+            let thought = a.args.get("__thought__").and_then(|t| t.as_str()).unwrap_or("");
+            let desc = if thought.is_empty() {
+                format!("{} args: {:?}", a.action, a.args)
+            } else {
+                format!("{} args: {:?} | thought: {}", a.action, a.args, thought)
+            };
+            prep.traces.info("action".into(), desc);
         }
 
-        // 检查是否有 answer action
-        let answer = actions.iter().find(|a| a.action == "answer");
-        if let Some(answer) = answer {
-            let reply = answer.args.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
-            prep.traces.info("💬 最终回答".into(), reply.chars().take(200).collect());
-            return runtime::AgentResult {
-                reply,
-                traces: prep.traces.all().to_vec(),
-                error: None,
-                tool_calls: vec![],
-            };
+        // 检查是否有 final_answer / ask_user
+        let has_final = actions.iter().any(|a| a.action == "final_answer" || a.action == "answer");
+        let has_ask = actions.iter().any(|a| a.action == "ask_user");
+        let final_content = actions.iter()
+            .find(|a| a.action == "final_answer" || a.action == "answer")
+            .and_then(|a| a.args.get("content").and_then(|c| c.as_str()))
+            .unwrap_or("").to_string();
+        let ask_content = actions.iter()
+            .find(|a| a.action == "ask_user")
+            .and_then(|a| a.args.get("question").and_then(|c| c.as_str()))
+            .unwrap_or("").to_string();
+
+        // 只有 final_answer/ask_user 无工具调用 → 直接返回
+        if has_final && actions.iter().all(|a| a.action == "final_answer" || a.action == "answer") {
+            prep.traces.info("💬 最终回答".into(), final_content.clone());
+            return runtime::AgentResult { reply: final_content, traces: prep.traces.all().to_vec(), error: None, tool_calls: vec![] };
+        }
+        if has_ask && actions.iter().all(|a| a.action == "ask_user") {
+            prep.traces.info("❓ 向用户提问".into(), ask_content.clone());
+            return runtime::AgentResult { reply: format!("[Agent 提问] {}", ask_content), traces: prep.traces.all().to_vec(), error: None, tool_calls: vec![] };
         }
 
         // 执行所有工具调用
         let mut results_text = String::new();
         for action in &actions {
+            if action.action == "final_answer" || action.action == "answer" || action.action == "ask_user" { continue; }
             prep.traces.info("工具调用".into(), format!("{}: {:?}", action.action, action.args));
 
             if !prep.tool_registry.has(&action.action) {
@@ -190,10 +207,16 @@ async fn run_agent_loop(mut prep: runtime::AgentLoopContext) -> runtime::AgentRe
 
             let result = prep.tool_registry.execute(&action.action, &serde_json::Value::Object(action.args.clone())).await;
             let result_str = match &result {
-                Ok(r) => { prep.traces.info("工具结果".into(), r.chars().take(100).collect()); r.clone() }
+                Ok(r) => { prep.traces.info("工具结果".into(), r.clone()); r.clone() }
                 Err(e) => { prep.traces.error("工具错误".into(), e.clone()); e.clone() }
             };
             results_text += &format!("[工具结果] {}: {}\n", action.action, result_str);
+        }
+
+        // 工具 + final_answer 混合 → 返回最终结果（不回 LLM）
+        if has_final {
+            prep.traces.info("💬 最终回答".into(), final_content.clone());
+            return runtime::AgentResult { reply: final_content, traces: prep.traces.all().to_vec(), error: None, tool_calls: vec![] };
         }
 
         // 将工具结果发给 LLM 汇总
@@ -262,14 +285,14 @@ mod tests {
         let mut sm = SessionManager::new();
         let s = sm.create("c".to_string());
         for _ in 0..50 {
-            s.messages.push(Message {
+            s.memory.short_term.push(Message {
                 role: "user".into(), content: "x".into(), tool_call_id: None, tool_name: None,
             });
         }
         s.compress();
-        assert_eq!(s.messages[0].role, "system");
-        assert!(s.messages[1].content.contains("上下文已压缩"));
-        assert_eq!(s.messages.len(), 42);
+        assert_eq!(s.memory.short_term[0].role, "system");
+        assert!(s.memory.short_term[1].content.contains("上下文已压缩"));
+        assert_eq!(s.memory.short_term.len(), 42);
     }
 
     #[test]
@@ -277,13 +300,13 @@ mod tests {
         let mut sm = SessionManager::new();
         let s = sm.create("c".to_string());
         for _ in 0..10 {
-            s.messages.push(Message {
+            s.memory.short_term.push(Message {
                 role: "user".into(), content: "x".into(), tool_call_id: None, tool_name: None,
             });
         }
-        let before = s.messages.len();
+        let before = s.memory.short_term.len();
         s.compress();
-        assert_eq!(s.messages.len(), before);
+        assert_eq!(s.memory.short_term.len(), before);
     }
 
     // ========== Parser ==========
@@ -296,16 +319,16 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_use_tool() {
-        let a = parser::parse_actions(r#"{"action": "use_tool", "tool": "weather", "params": {"city": "北京"}}"#);
+    fn test_parse_tool_call() {
+        let a = parser::parse_actions(r#"{"type": "tool_call", "tool": "weather", "params": {"city": "北京"}}"#);
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].action, "weather");
     }
 
     #[test]
     fn test_parse_multiple() {
-        let raw = r#"{"action": "use_tool", "tool": "weather", "params": {"city": "广州"}}
-{"action": "use_tool", "tool": "weather", "params": {"city": "北京"}}"#;
+        let raw = r#"{"type": "tool_call", "tool": "weather", "params": {"city": "广州"}}
+{"type": "tool_call", "tool": "weather", "params": {"city": "北京"}}"#;
         let a = parser::parse_actions(raw);
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].action, "weather");
@@ -374,7 +397,7 @@ mod tests {
     #[test]
     fn test_system_prompt() {
         let p = session::system_prompt();
-        assert!(p.contains("use_tool"));
+        assert!(p.contains("tool_call"));
         assert!(p.contains("answer"));
         assert!(p.contains("工具名"));
     }

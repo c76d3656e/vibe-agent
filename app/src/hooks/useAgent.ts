@@ -7,6 +7,8 @@ interface AgentState {
   currentSessionId: string | null
   messages: Session['messages']
   traces: TraceEntry[]
+  /** 按 session 累积的 trace 日志 */
+  sessionTraces: Record<string, TraceEntry[]>
   processingSessions: Record<string, boolean>
   loading: boolean
   error: string | null
@@ -18,6 +20,7 @@ export function useAgent() {
     currentSessionId: null,
     messages: [],
     traces: [],
+    sessionTraces: {},
     processingSessions: {},
     loading: true,
     error: null,
@@ -108,7 +111,12 @@ export function useAgent() {
 
   const selectSession = useCallback((id: string) => {
     const messages = JSON.parse(Wasm.getSessionMessages(id))
-    setState((s) => ({ ...s, currentSessionId: id, messages, traces: [] }))
+    setState((s) => ({
+      ...s,
+      currentSessionId: id,
+      messages,
+      traces: s.sessionTraces[id] ?? [],
+    }))
   }, [])
 
   // ========== 发送消息（按 session 独立处理） ==========
@@ -132,13 +140,16 @@ export function useAgent() {
       syncSessions(sessions)
 
       setState((s) => {
-        // 如果用户切换了 session，不覆盖当前显示的消息
         const isSameSession = s.currentSessionId === sid
         const msgs = isSameSession ? JSON.parse(Wasm.getSessionMessages(sid)) : s.messages
+        // 累积 trace：追加到该 session 的历史中
+        const prevTraces = s.sessionTraces[sid] ?? []
+        const newTraces = [...prevTraces, ...(result.traces ?? [])]
         return {
           ...s, sessions,
           messages: msgs,
-          traces: isSameSession ? (result.traces ?? []) : s.traces,
+          traces: isSameSession ? newTraces : s.traces,
+          sessionTraces: { ...s.sessionTraces, [sid]: newTraces },
           error: isSameSession ? (result.error ?? null) : s.error,
           processingSessions: { ...s.processingSessions, [sid]: false },
         }

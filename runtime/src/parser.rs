@@ -3,32 +3,38 @@ use serde::{Deserialize, Serialize};
 /// 解析后的 action
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentAction {
-    pub action: String,
-    #[serde(flatten)]
+    pub action: String,        // "final_answer" | "tool_call" | "ask_user"
     pub args: serde_json::Map<String, serde_json::Value>,
 }
 
 /// 从 LLM 响应中提取所有 JSON action
-/// LLM 回复中只有 JSON 是有效内容，其余都是幻觉
 /// 支持格式：
-///   {"action": "answer", "content": "..."}
-///   {"action": "use_tool", "tool": "calculator", "params": {...}}
-///   也兼容旧格式：{"action": "calculator", "expression": "..."}
+///   {"type": "final_answer", "content": "..."}
+///   {"type": "tool_call", "tool": "calculator", "params": {...}, "thought": "..."}
+///   {"type": "ask_user", "question": "..."}
+///   兼容旧格式：{"action": "answer", "content": "..."}
 pub fn parse_actions(raw: &str) -> Vec<AgentAction> {
     let text = extract_text(raw);
-    let jsons = extract_json_objects(&text);
+    let json_strs = extract_json_objects(&text);
+
+    // 如果没找到，尝试 regex 风格兜底（找第一个完整 {}）
+    let json_strs = if json_strs.is_empty() {
+        fallback_extract_json(&text)
+    } else {
+        json_strs
+    };
 
     let mut actions = Vec::new();
-    for json_str in jsons {
-        match parse_single_action(&json_str) {
-            Ok(action) => actions.push(action),
-            Err(_) => continue, // 解析失败的 JSON 跳过
+    for s in json_strs {
+        match parse_single(&s) {
+            Ok(a) => actions.push(a),
+            Err(_) => continue,
         }
     }
     actions
 }
 
-/// 从文本中提取所有顶级 {} 包裹的 JSON 字符串
+/// 提取所有顶级 {} 包裹的 JSON 字符串
 fn extract_json_objects(text: &str) -> Vec<String> {
     let mut results = Vec::new();
     let mut depth = 0i32;
@@ -36,70 +42,82 @@ fn extract_json_objects(text: &str) -> Vec<String> {
 
     for (i, ch) in text.char_indices() {
         match ch {
-            '{' => {
-                if depth == 0 { start = i; }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    results.push(text[start..=i].to_string());
-                }
-            }
+            '{' => { if depth == 0 { start = i; } depth += 1; }
+            '}' => { depth -= 1; if depth == 0 { results.push(text[start..=i].to_string()); } }
             _ => {}
         }
     }
     results
 }
 
-/// 解析单个 JSON action
-fn parse_single_action(json_str: &str) -> Result<AgentAction, String> {
-    let parsed: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| format!("JSON 解析失败: {}", e))?;
+/// fallback：在文本中找第一个 { ... } 块（类似 regex search）
+fn fallback_extract_json(text: &str) -> Vec<String> {
+    if let Some(start) = text.find('{') {
+        let mut depth = 0i32;
+        for (i, ch) in text[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => { depth -= 1; if depth == 0 { return vec![text[start..start + i + 1].to_string()]; } }
+                _ => {}
+            }
+        }
+    }
+    Vec::new()
+}
 
-    let action = parsed.get("action").and_then(|a| a.as_str())
-        .ok_or_else(|| "缺少 action 字段".to_string())?;
+/// 解析单个 JSON 为 AgentAction
+fn parse_single(json_str: &str) -> Result<AgentAction, String> {
+    let parsed: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|_| "JSON 解析失败".to_string())?;
+
+    // 判断使用 type 还是 action 字段
+    let type_field = parsed.get("type").and_then(|t| t.as_str())
+        .or_else(|| parsed.get("action").and_then(|a| a.as_str()))
+        .ok_or_else(|| "缺少 type/action 字段".to_string())?;
 
     let mut args = serde_json::Map::new();
 
-    match action {
-        "use_tool" => {
+    match type_field {
+        "tool_call" | "use_tool" => {
+            // {"type": "tool_call", "tool": "calc", "params": {...}, "thought": "..."}
+            // 兼容旧: {"action": "use_tool", "tool": "calc", "params": {...}}
             let tool_name = parsed.get("tool").and_then(|t| t.as_str())
-                .ok_or_else(|| "use_tool 缺少 tool 字段".to_string())?;
+                .ok_or_else(|| "tool_call 缺少 tool 字段".to_string())?;
             if let Some(params) = parsed.get("params").and_then(|p| p.as_object()) {
                 for (k, v) in params { args.insert(k.clone(), v.clone()); }
             }
+            // thought 字段记入 args 以便 trace 展示
+            if let Some(thought) = parsed.get("thought").and_then(|t| t.as_str()) {
+                args.insert("__thought__".to_string(), serde_json::Value::String(thought.to_string()));
+            }
             return Ok(AgentAction { action: tool_name.to_string(), args });
         }
-        "answer" => {
+        "final_answer" | "answer" => {
+            // {"type": "final_answer", "content": "..."}
             let content = parsed.get("content").and_then(|c| c.as_str()).unwrap_or("");
             args.insert("content".to_string(), serde_json::Value::String(content.to_string()));
+        }
+        "ask_user" => {
+            // {"type": "ask_user", "question": "..."}
+            let question = parsed.get("question").and_then(|q| q.as_str()).unwrap_or("");
+            args.insert("question".to_string(), serde_json::Value::String(question.to_string()));
         }
         _ => {
             // 旧格式：{"action": "calculator", "expression": "..."}
             if let Some(obj) = parsed.as_object() {
                 for (k, v) in obj {
-                    if k != "action" { args.insert(k.clone(), v.clone()); }
+                    if k != "action" && k != "type" { args.insert(k.clone(), v.clone()); }
                 }
             }
         }
     }
 
-    Ok(AgentAction { action: action.to_string(), args })
+    Ok(AgentAction { action: type_field.to_string(), args })
 }
 
 /// 提取 think/reasoning 标签内的思考内容（用于日志展示）
 pub fn extract_think(raw: &str) -> Option<String> {
-    let text = if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
-        if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
-            if let Some(choice) = choices.first() {
-                if let Some(msg) = choice.get("message") {
-                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string()
-                } else { return None; }
-            } else { return None; }
-        } else { return None; }
-    } else { return None; };
-
+    let text = extract_raw_content(raw);
     for tag in &["think", "reasoning"] {
         let open = format!("<{}>", tag);
         let close = format!("</{}>", tag);
@@ -116,29 +134,25 @@ pub fn extract_think(raw: &str) -> Option<String> {
 
 /// 提取纯文本（去掉 think 标签和 markdown）
 pub fn extract_text_content(raw: &str) -> String {
-    let text = if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
-        if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
-            if let Some(choice) = choices.first() {
-                if let Some(msg) = choice.get("message") {
-                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string()
-                } else { raw.to_string() }
-            } else { raw.to_string() }
-        } else { raw.to_string() }
-    } else { raw.to_string() };
+    let text = extract_raw_content(raw);
     strip_think_tags(&strip_markdown(&text))
 }
 
-fn extract_text(raw: &str) -> String {
-    let text = if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
+fn extract_raw_content(raw: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
         if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
             if let Some(choice) = choices.first() {
                 if let Some(msg) = choice.get("message") {
-                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string()
-                } else { raw.to_string() }
-            } else { raw.to_string() }
-        } else { raw.to_string() }
-    } else { raw.to_string() };
-    strip_think_tags(&strip_markdown(&text))
+                    return msg.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                }
+            }
+        }
+    }
+    raw.to_string()
+}
+
+fn extract_text(raw: &str) -> String {
+    strip_think_tags(&strip_markdown(&extract_raw_content(raw)))
 }
 
 fn strip_think_tags(s: &str) -> String {

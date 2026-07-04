@@ -76,7 +76,7 @@ impl AgentRuntime {
             return Err("会话已过期，请创建新会话".to_string());
         }
 
-        session.messages.push(Message {
+        session.memory.short_term.push(Message {
             role: "user".to_string(),
             content: input,
             tool_call_id: None,
@@ -88,7 +88,7 @@ impl AgentRuntime {
             api_url: self.api_url.clone(),
             api_key: self.api_key.clone(),
             model: self.model.clone(),
-            messages: session.messages.clone(),
+            messages: session.memory.short_term.clone(),
             tool_registry: ToolRegistry::new(),
             traces: TraceLogger::new(),
         })
@@ -97,7 +97,7 @@ impl AgentRuntime {
     pub fn finish_send_message(&mut self, session_id: &str, result: &AgentResult) {
         match self.session_manager.get_mut(session_id) {
             Some(session) => {
-                session.messages.push(Message {
+                session.memory.short_term.push(Message {
                     role: "assistant".to_string(),
                     content: result.reply.clone(),
                     tool_call_id: None,

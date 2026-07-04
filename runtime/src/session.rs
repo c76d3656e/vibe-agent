@@ -1,10 +1,11 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use crate::context::Message;
 use crate::tools::ToolRegistry;
+use crate::memory::Memory;
 
 /// 会话
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
     pub name: String,
@@ -13,30 +14,33 @@ pub struct Session {
     pub updated_at: u64,
     pub turn_count: u32,
     pub max_turns: u32,
+    pub memory: Memory,
 }
 
-/// 系统提示词
+/// 系统提示词（ReAct 风格）
 pub fn system_prompt() -> String {
     let tool_desc = ToolRegistry::new().description();
     format!(
         "你是一个智能助手，可以使用工具来帮助用户。\n\
          \n\
          {}\n\
-         回复格式要求：\n\
+         回复必须是以下 JSON 格式之一：\n\
          \n\
-         1. 直接回答：\n\
-         {{\"action\": \"answer\", \"content\": \"你的回答\"}}\n\
+         1. 使用工具（可以多次使用）：\n\
+         {{\"type\": \"tool_call\", \"tool\": \"工具名\", \"params\": {{\"参数名\": \"参数值\"}}, \"thought\": \"为什么用这个工具\"}}\n\
          \n\
-         2. 需要调用工具：\n\
-         {{\"action\": \"use_tool\", \"tool\": \"工具名\", \"params\": {{\"参数名\": \"参数值\"}}}}\n\
+         2. 任务已完成：\n\
+         {{\"type\": \"final_answer\", \"content\": \"最终答案内容\"}}\n\
          \n\
-         3. 需要同时做多件事时，连续输出多个 JSON，每行一个：\n\
-         {{\"action\": \"use_tool\", \"tool\": \"工具名\", \"params\": {{\"参数名\": \"参数值\"}}}}\n\
-         {{\"action\": \"use_tool\", \"tool\": \"工具名\", \"params\": {{\"参数名\": \"参数值\"}}}}\n\
+         3. 需要向用户提问：\n\
+         {{\"type\": \"ask_user\", \"question\": \"你的问题\"}}\n\
          \n\
-         参数名必须和工具定义完全一致（英文）。\n\
-         只返回 JSON，不要加任何解释。\n\
-         不要使用 think/reasoning 标签。",
+         规则：\n\
+         - 收集到足够信息后，必须给出 final_answer\n\
+         - 不要用相同参数重复调用同一个工具\n\
+         - 如果一次需要多个工具，连续输出多行 JSON\n\
+         - 参数名必须和工具定义完全一致（英文）\n\
+         - 只返回 JSON，不要加任何解释",
         tool_desc
     )
 }
@@ -44,49 +48,61 @@ pub fn system_prompt() -> String {
 impl Session {
     pub fn new(name: String) -> Self {
         let now = unix_ms();
+        let mut memory = Memory::new();
+        memory.set_system(Message {
+            role: "system".to_string(),
+            content: system_prompt(),
+            tool_call_id: None,
+            tool_name: None,
+        });
         Self {
             id: generate_id(),
             name,
-            messages: vec![Message {
-                role: "system".to_string(),
-                content: system_prompt(),
-                tool_call_id: None,
-                tool_name: None,
-            }],
+            messages: Vec::new(),
             created_at: now,
             updated_at: now,
             turn_count: 0,
             max_turns: 50,
+            memory,
         }
+    }
+
+    /// 同步 messages 从 memory（用于序列化返回给前端）
+    pub fn sync(&mut self) {
+        self.messages = self.memory.short_term.clone();
+    }
+
+    /// 序列化为 JSON（含 messages）
+    pub fn to_json(&self) -> String {
+        #[derive(Serialize)]
+        struct SessionJson<'a> {
+            id: &'a str,
+            name: &'a str,
+            messages: &'a [Message],
+            created_at: u64,
+            updated_at: u64,
+            turn_count: u32,
+            max_turns: u32,
+        }
+        let json = SessionJson {
+            id: &self.id,
+            name: &self.name,
+            messages: &self.memory.short_term,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            turn_count: self.turn_count,
+            max_turns: self.max_turns,
+        };
+        serde_json::to_string(&json).unwrap_or_default()
     }
 
     pub fn is_expired(&self) -> bool {
         self.turn_count >= self.max_turns
     }
 
+    /// 压缩记忆
     pub fn compress(&mut self) {
-        if self.messages.len() <= 41 {
-            return;
-        }
-        let mut system = Vec::new();
-        let mut rest = Vec::new();
-        for m in self.messages.drain(..) {
-            if m.role == "system" {
-                system.push(m);
-            } else {
-                rest.push(m);
-            }
-        }
-        let keep = rest.split_off(rest.len().saturating_sub(40));
-        let summary = Message {
-            role: "assistant".to_string(),
-            content: format!("[上下文已压缩，省略了之前 {} 条消息]", rest.len()),
-            tool_call_id: None,
-            tool_name: None,
-        };
-        self.messages = system;
-        self.messages.push(summary);
-        self.messages.extend(keep);
+        self.memory.compress();
         self.updated_at = unix_ms();
     }
 }

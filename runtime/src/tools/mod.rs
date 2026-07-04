@@ -63,7 +63,7 @@ impl ToolRegistry {
             lines.push(String::new());
         }
         lines.push("调用工具示例：".to_string());
-        lines.push(r#"{"action": "use_tool", "tool": "calculator", "params": {"expression": "1+1"}}"#.to_string());
+        lines.push(r#"{"type": "tool_call", "tool": "calculator", "params": {"expression": "1+1"}, "thought": "需要计算"}"#.to_string());
         lines.push(String::new());
         lines.push("直接回答示例：".to_string());
         lines.push(r#"{"action": "answer", "content": "你的回答"}"#.to_string());
